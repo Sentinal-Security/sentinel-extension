@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["wxt/browser"]
+  },
+  "include": [
+    "entrypoints/**/*",
+    "utils/**/*",
+    "wxt.config.ts"
+  ]
+}

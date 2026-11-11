@@ -1,0 +1,13 @@
+# Git Town configuration file
+# See https://www.git-town.com/preferences/config-file for details
+
+[branches]
+main = "main"
+perennials = ["development"]
+
+[sync]
+feature-strategy = "merge"
+perennial-strategy = "rebase"
+push-branches = true
+tags = true
+upstream = true
