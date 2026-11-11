@@ -3,7 +3,13 @@ import { browser } from "wxt/browser";
 export default defineContentScript({
   matches: [
     "https://web-beta-orcin-33.vercel.app/*",
+    "https://sentinal-security.vercel.app/*",
     "http://localhost:3000/*",
+    "http://localhost:3001/*",
+    "http://localhost:3002/*",
+    "http://localhost:3003/*",
+    "http://localhost:3004/*",
+    "http://127.0.0.1:3000/*",
   ],
   runAt: "document_start",
   main() {

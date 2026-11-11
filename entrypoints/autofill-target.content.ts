@@ -4,8 +4,11 @@ export default defineContentScript({
   matches: ["<all_urls>"],
   excludeMatches: [
     "https://web-beta-orcin-33.vercel.app/*",
+    "https://sentinal-security.vercel.app/*",
     "http://localhost:3000/*",
+    "http://127.0.0.1:3000/*",
   ],
+  allFrames: true,
   runAt: "document_idle",
   main() {
     // Native prototype property setter to bypass React 16-19 controlled input overrides
