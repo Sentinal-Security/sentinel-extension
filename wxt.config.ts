@@ -13,6 +13,7 @@ export default defineConfig({
       "tabs",
       "activeTab",
       "cookies",
+      "scripting",
     ],
     host_permissions: [
       "https://web-beta-orcin-33.vercel.app/*",

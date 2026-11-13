@@ -159,7 +159,74 @@ export default defineBackground(() => {
         };
       }
     } catch {}
+    await probeOpenPortalTabs();
   })();
+
+  // Probe any already-open Sentinel Web Portal tabs to sync session immediately after extension reload
+  async function probeOpenPortalTabs(): Promise<void> {
+    if (sentinelSession.isLoggedIn && sentinelSession.user?.userId) return;
+    if (!browser.tabs?.query || !(browser as any).scripting?.executeScript) return;
+    try {
+      const tabs = await browser.tabs.query({
+        url: [
+          "https://web-beta-orcin-33.vercel.app/*",
+          "https://sentinal-security.vercel.app/*",
+          "http://localhost:3000/*",
+          "http://127.0.0.1:3000/*",
+        ],
+      });
+      for (const tab of tabs) {
+        if (!tab.id) continue;
+        try {
+          const results = await (browser as any).scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+              const portalOrigin = window.location.origin;
+              let user = null;
+              let token = undefined;
+              for (const k of ["sentinel_auth_session", "sentinel_session"]) {
+                try {
+                  const raw = localStorage.getItem(k);
+                  if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (parsed?.user) {
+                      user = parsed.user;
+                      token = parsed.token;
+                      break;
+                    }
+                  }
+                } catch {}
+              }
+              let services: any[] = [];
+              if (user?.userId) {
+                for (const sk of [
+                  `sentinel_dashboard_integrations_u${user.userId}`,
+                  "sentinel_dashboard_integrations",
+                ]) {
+                  try {
+                    const rawS = localStorage.getItem(sk);
+                    if (rawS) {
+                      const parsedS = JSON.parse(rawS);
+                      if (Array.isArray(parsedS)) {
+                        services = parsedS;
+                        break;
+                      }
+                    }
+                  } catch {}
+                }
+              }
+              return { isLoggedIn: Boolean(user), user, token, portalOrigin, services };
+            },
+          });
+          const res = results?.[0]?.result;
+          if (res?.isLoggedIn && res?.user) {
+            syncSessionState(res);
+            return;
+          }
+        } catch {}
+      }
+    } catch {}
+  }
 
   // Dynamically fetch latest services from the backend API so newly added services work immediately
   async function refreshServicesFromBackend(force = false): Promise<ExtensionServiceItem[]> {
@@ -433,8 +500,40 @@ export default defineBackground(() => {
           return;
         }
 
+        if (!sentinelSession.isLoggedIn || !sentinelSession.user?.userId) {
+          await probeOpenPortalTabs();
+        }
+
         const services = await refreshServicesFromBackend(false);
-        const matchedService = matchServiceForUrl(message.url || sender.tab?.url || "", services);
+        const targetUrlStr = message.url || sender.tab?.url || "";
+        let matchedService = matchServiceForUrl(targetUrlStr, services);
+
+        // If user has not logged into Sentinel yet (so services catalog is not yet known),
+        // still allow the in-site popup on login pages so clicking "Authenticate with Sentinel"
+        // opens Sentinel /login, authenticates the user, resolves their service from the backend, and signs in.
+        if (!matchedService && !sentinelSession.isLoggedIn && services.length === 0) {
+          const parsed = parseUrlSafe(targetUrlStr);
+          if (parsed && !isSentinelPortalUrl(parsed)) {
+            const demoKey = resolveDemoAppKey(parsed);
+            const host = stripWww(parsed.hostname);
+            let friendlyName = host;
+            if (demoKey === "acme_hr") friendlyName = "Acme HR Portal";
+            else if (demoKey === "fintech_payroll") friendlyName = "FinTech Payroll Portal";
+            else if (demoKey === "devops_incident") friendlyName = "DevOps Incident Command";
+            else if (host.includes("facebook.com")) friendlyName = "Facebook";
+            else if (host.includes("github.com")) friendlyName = "GitHub";
+            else if (host.includes("google.com")) friendlyName = "Google";
+
+            matchedService = {
+              id: "",
+              name: friendlyName,
+              loginUrl: targetUrlStr,
+              clientId: demoKey || "",
+              isVault: !demoKey,
+              mfaRequired: true,
+            };
+          }
+        }
 
         if (!matchedService) {
           sendResponse({ matched: false });

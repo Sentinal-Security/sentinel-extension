@@ -101,17 +101,38 @@ export default defineContentScript({
       if (!usernameInput) {
         const candidates = Array.from(
           document.querySelectorAll<HTMLInputElement>(
-            'input#email, input[name="email"], input[autocomplete="username"], input[autocomplete="email"], input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[id*="email" i], input[id*="user" i]'
+            'input#email, input[name="email"], input[autocomplete="username"], input[autocomplete="email"], input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[id*="email" i], input[id*="user" i], input[placeholder*="email" i], input[placeholder*="user" i]'
           )
         ).filter((el) => isVisibleInput(el));
         usernameInput = candidates[0] || null;
       }
 
+      if (!usernameInput && passwordInput) {
+        const allTextInputs = Array.from(
+          document.querySelectorAll<HTMLInputElement>(
+            'input:not([type="password"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])'
+          )
+        ).filter((el) => isVisibleInput(el));
+        for (let i = allTextInputs.length - 1; i >= 0; i--) {
+          const candidate = allTextInputs[i];
+          if (
+            candidate.compareDocumentPosition(passwordInput) &
+            Node.DOCUMENT_POSITION_FOLLOWING
+          ) {
+            usernameInput = candidate;
+            break;
+          }
+        }
+      }
+
       return { usernameInput, passwordInput };
     }
 
-    function findSubmitButton(form: HTMLFormElement | null): HTMLElement | null {
-      const selectors = [
+    function findSubmitButton(
+      form: HTMLFormElement | null,
+      passwordInput?: HTMLInputElement | null
+    ): HTMLElement | null {
+      const explicitSelectors = [
         'button[name="login"]',
         "#loginbutton",
         '[data-testid*="royal-login" i]',
@@ -120,12 +141,37 @@ export default defineContentScript({
         'input[type="submit"]',
         '[role="button"][aria-label*="log in" i]',
         '[role="button"][aria-label*="sign in" i]',
-        'button:not([type="button"])',
       ];
-      const scope: ParentNode = form || document;
-      for (const selector of selectors) {
+      const scope: ParentNode =
+        form ||
+        passwordInput?.closest("form, [role='dialog'], main, section, div") ||
+        document;
+
+      for (const selector of explicitSelectors) {
         const el = scope.querySelector<HTMLElement>(selector);
         if (el) return el;
+      }
+
+      // Check buttons by visible text (Sign In, Log In, Submit, Continue, Next)
+      const buttons = Array.from(
+        (form || document).querySelectorAll<HTMLElement>('button, [role="button"], input[type="button"]')
+      );
+      const byText = buttons.find((btn) => {
+        const text = (
+          (btn.textContent || "") +
+          " " +
+          (btn.getAttribute("value") || "") +
+          " " +
+          (btn.getAttribute("aria-label") || "")
+        )
+          .trim()
+          .toLowerCase();
+        return /\b(sign in|log in|login|submit|continue|authorize)\b/.test(text);
+      });
+      if (byText) return byText;
+
+      if (form) {
+        return form.querySelector<HTMLElement>('button:not([type="button"])');
       }
       return null;
     }
@@ -515,7 +561,7 @@ export default defineContentScript({
             setTimeout(() => {
               removeInPagePrompt();
               const form = passwordInput.form || passwordInput.closest("form");
-              const submitBtn = findSubmitButton(form);
+              const submitBtn = findSubmitButton(form, passwordInput);
               if (submitBtn) {
                 submitBtn.click();
               } else if (form && typeof (form as any).requestSubmit === "function") {
