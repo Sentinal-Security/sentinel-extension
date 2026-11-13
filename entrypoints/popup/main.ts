@@ -11,7 +11,14 @@ document.addEventListener("DOMContentLoaded", () => {
       if (response && response.isLoggedIn && response.user) {
         renderLoggedIn(response.user);
       } else {
-        renderLoggedOut();
+        browser.storage.local.get("sentinelSession").then((stored: any) => {
+          const s = stored?.sentinelSession;
+          if (s && s.isLoggedIn && s.user) {
+            renderLoggedIn(s.user);
+          } else {
+            renderLoggedOut();
+          }
+        }).catch(() => renderLoggedOut());
       }
     }).catch(() => {
       renderLoggedOut();

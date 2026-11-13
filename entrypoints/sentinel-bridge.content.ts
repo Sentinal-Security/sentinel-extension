@@ -13,7 +13,7 @@ export default defineContentScript({
   ],
   runAt: "document_start",
   main() {
-    const EXTENSION_VERSION = "1.1.0";
+    const EXTENSION_VERSION = "1.1.1";
 
     // 1. Mark DOM attribute immediately and maintain heartbeat
     function stampPresence() {
@@ -57,27 +57,35 @@ export default defineContentScript({
     }
 
     // 3. Inspect and relay session state to background worker
-    function checkPortalSession() {
-      let isLoggedIn = false;
-      let user = null;
-
-      try {
-        const raw = localStorage.getItem("sentinel_session");
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && parsed.user) {
-            isLoggedIn = true;
-            user = parsed.user;
+    function readStoredPortalSession(): { isLoggedIn: boolean; user: any } {
+      for (const key of ["sentinel_auth_session", "sentinel_session"]) {
+        try {
+          const raw = localStorage.getItem(key);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.user) {
+              return { isLoggedIn: true, user: parsed.user };
+            }
           }
-        }
-      } catch {}
+        } catch {}
+      }
+      return { isLoggedIn: false, user: null };
+    }
 
+    function checkPortalSession() {
+      const session = readStoredPortalSession();
       try {
         browser.runtime.sendMessage({
           type: "SENTINEL_SESSION_UPDATE",
-          session: { isLoggedIn, user },
+          session,
         }).catch(() => {});
       } catch {}
+
+      if (!session.isLoggedIn) {
+        try {
+          window.dispatchEvent(new CustomEvent("SENTINEL_GET_SESSION"));
+        } catch {}
+      }
     }
 
     checkPortalSession();
@@ -85,7 +93,7 @@ export default defineContentScript({
 
     // Real-time synchronization when login/logout changes in local storage
     window.addEventListener("storage", (e: StorageEvent) => {
-      if (e.key === "sentinel_session") {
+      if (e.key === "sentinel_auth_session" || e.key === "sentinel_session") {
         checkPortalSession();
       }
     });
@@ -102,19 +110,48 @@ export default defineContentScript({
     });
 
     // 4. Relay authorized vault launches from the Sentinel Web Portal
-    window.addEventListener("SENTINEL_VAULT_LAUNCH", (e: any) => {
+    window.addEventListener("SENTINEL_VAULT_LAUNCH", async (e: any) => {
       const detail = e.detail;
-      if (!detail || !detail.destination || !detail.password) return;
+      if (!detail || !detail.destination || !detail.password) {
+        window.dispatchEvent(
+          new CustomEvent("SENTINEL_VAULT_LAUNCH_RESULT", {
+            detail: { success: false, reason: "INVALID_PAYLOAD" },
+          })
+        );
+        return;
+      }
+
+      const session = readStoredPortalSession();
 
       try {
-        browser.runtime.sendMessage({
+        if (session.isLoggedIn) {
+          await browser.runtime.sendMessage({
+            type: "SENTINEL_SESSION_UPDATE",
+            session,
+          }).catch(() => {});
+        }
+
+        const result = await browser.runtime.sendMessage({
           type: "TRIGGER_VAULT_AUTOFILL",
           destination: detail.destination,
           username: detail.username,
           password: detail.password,
           appName: detail.appName,
-        }).catch(() => {});
-      } catch {}
+          session: session.isLoggedIn ? session : undefined,
+        });
+
+        window.dispatchEvent(
+          new CustomEvent("SENTINEL_VAULT_LAUNCH_RESULT", {
+            detail: result || { success: false, reason: "NO_RESPONSE" },
+          })
+        );
+      } catch (err) {
+        window.dispatchEvent(
+          new CustomEvent("SENTINEL_VAULT_LAUNCH_RESULT", {
+            detail: { success: false, reason: "BRIDGE_ERROR", error: String(err) },
+          })
+        );
+      }
     });
   },
 });

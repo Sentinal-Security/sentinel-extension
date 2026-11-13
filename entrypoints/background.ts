@@ -44,24 +44,31 @@ export default defineBackground(() => {
     } catch {}
   }
 
-  // Restore stored session on initialization
-  try {
-    browser.storage.local.get("sentinelSession").then((result: any) => {
-      if (result && result.sentinelSession) {
+  function zeroizeAndDelete(tabId: number) {
+    const item = ephemeralVaultQueue.get(tabId);
+    if (item) {
+      item.password = null;
+      item.username = null;
+      ephemeralVaultQueue.delete(tabId);
+    }
+  }
+
+  // Restore stored session on initialization (awaitable to avoid MV3 worker wake-up races)
+  const sessionReady = (async () => {
+    try {
+      const result: any = await browser.storage.local.get("sentinelSession");
+      if (result && result.sentinelSession && !sentinelSession.lastChecked) {
         sentinelSession = result.sentinelSession;
       }
-    });
-  } catch {}
+    } catch {}
+  })();
 
   // Clean expired pending injections periodically
   setInterval(() => {
     const now = Date.now();
     for (const [tabId, item] of ephemeralVaultQueue.entries()) {
       if (item.expiresAt < now) {
-        // Zeroize memory
-        item.password = null;
-        item.username = null;
-        ephemeralVaultQueue.delete(tabId);
+        zeroizeAndDelete(tabId);
       }
     }
   }, 10000);
@@ -69,12 +76,7 @@ export default defineBackground(() => {
   // If a pending target tab is closed by the user before autofill runs, purge credentials immediately
   if (browser.tabs && browser.tabs.onRemoved) {
     browser.tabs.onRemoved.addListener((tabId) => {
-      if (ephemeralVaultQueue.has(tabId)) {
-        const item = ephemeralVaultQueue.get(tabId)!;
-        item.password = null;
-        item.username = null;
-        ephemeralVaultQueue.delete(tabId);
-      }
+      zeroizeAndDelete(tabId);
     });
   }
 
@@ -91,104 +93,125 @@ export default defineBackground(() => {
 
     // 2. Query session status from popup or bridge
     if (message.type === "GET_SENTINEL_STATUS") {
-      sendResponse({
-        isLoggedIn: sentinelSession.isLoggedIn,
-        user: sentinelSession.user,
-        version: "1.1.0",
+      sessionReady.then(() => {
+        sendResponse({
+          isLoggedIn: sentinelSession.isLoggedIn,
+          user: sentinelSession.user,
+          version: "1.1.1",
+        });
       });
       return true;
     }
 
     // 3. Vault launch initiated from Sentinel Web Portal
     if (message.type === "TRIGGER_VAULT_AUTOFILL") {
-      if (!sentinelSession.isLoggedIn) {
-        sendResponse({ success: false, reason: "NOT_LOGGED_IN" });
-        return true;
-      }
+      sessionReady.then(() => {
+        if (message.session?.isLoggedIn && message.session?.user) {
+          syncSessionState(message.session);
+        }
 
-      const { destination, username, password, appName } = message;
-      if (!destination || !password) {
-        sendResponse({ success: false, reason: "INVALID_PAYLOAD" });
-        return true;
-      }
+        if (!sentinelSession.isLoggedIn) {
+          sendResponse({ success: false, reason: "NOT_LOGGED_IN" });
+          return;
+        }
 
-      let sanitizedUrl = String(destination).trim();
-      if (!/^https?:\/\//i.test(sanitizedUrl)) {
-        sanitizedUrl = "https://" + sanitizedUrl;
-      }
+        const { destination, username, password, appName } = message;
+        if (!destination || !password) {
+          sendResponse({ success: false, reason: "INVALID_PAYLOAD" });
+          return;
+        }
 
-      const nonce = (typeof crypto !== "undefined" && crypto.randomUUID)
-        ? crypto.randomUUID()
-        : String(Math.random()) + Date.now().toString(36);
+        let sanitizedUrl = String(destination).trim();
+        if (!/^https?:\/\//i.test(sanitizedUrl)) {
+          sanitizedUrl = "https://" + sanitizedUrl;
+        }
 
-      // Open or switch to target tab
-      try {
-        browser.tabs.create({ url: sanitizedUrl, active: true }).then((tab) => {
-          if (tab?.id) {
-            ephemeralVaultQueue.set(tab.id, {
-              nonce,
-              username: username || "",
-              password: password || "",
-              destination: sanitizedUrl,
-              appName: appName || "Application",
-              expiresAt: Date.now() + 60000, // 60-second validity window
-            });
-          }
-          sendResponse({ success: true, tabId: tab?.id });
-        });
-      } catch (err) {
-        sendResponse({ success: false, error: String(err) });
-      }
+        const nonce = (typeof crypto !== "undefined" && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : String(Math.random()) + Date.now().toString(36);
+
+        try {
+          browser.tabs.create({ url: sanitizedUrl, active: true }).then((tab) => {
+            if (tab?.id) {
+              ephemeralVaultQueue.set(tab.id, {
+                nonce,
+                username: username || "",
+                password: password || "",
+                destination: sanitizedUrl,
+                appName: appName || "Application",
+                expiresAt: Date.now() + 60000, // 60-second validity window
+              });
+            }
+            sendResponse({ success: true, tabId: tab?.id });
+          }).catch((err: any) => {
+            sendResponse({ success: false, reason: "TAB_CREATE_FAILED", error: String(err) });
+          });
+        } catch (err) {
+          sendResponse({ success: false, reason: "TAB_CREATE_FAILED", error: String(err) });
+        }
+      });
       return true;
     }
 
-    // 4. Target tab requests pending credentials
+    // 4. Target tab top frame requests pending credentials (do NOT allow hidden iframes to steal)
     if (message.type === "REQUEST_PENDING_CREDENTIALS") {
       const tabId = sender.tab?.id;
-      if (tabId && ephemeralVaultQueue.has(tabId)) {
+      const isTopFrame = sender.frameId === undefined || sender.frameId === 0;
+      if (tabId && isTopFrame && ephemeralVaultQueue.has(tabId)) {
         const item = ephemeralVaultQueue.get(tabId)!;
-        // Fulfill request and immediately zeroize credentials
-        const payload = {
+        if (item.expiresAt < Date.now()) {
+          zeroizeAndDelete(tabId);
+          sendResponse({ hasCredentials: false });
+          return true;
+        }
+        sendResponse({
           hasCredentials: true,
           username: item.username,
           password: item.password,
           appName: item.appName,
-        };
-
-        item.password = null;
-        item.username = null;
-        ephemeralVaultQueue.delete(tabId);
-
-        sendResponse(payload);
+        });
       } else {
         sendResponse({ hasCredentials: false });
       }
       return true;
     }
+
+    // 5. Target tab confirms credentials were injected -> zeroize immediately
+    if (message.type === "AUTOFILL_COMPLETED") {
+      const tabId = sender.tab?.id;
+      if (tabId) {
+        zeroizeAndDelete(tabId);
+      }
+      sendResponse({ success: true });
+      return true;
+    }
   });
 
-  // Watch for tab loading completion to dispatch injection
+  // Watch for tab loading completion to dispatch injection into the top frame
   if (browser.tabs && browser.tabs.onUpdated) {
     browser.tabs.onUpdated.addListener((tabId: number, changeInfo: any) => {
       if (changeInfo.status === "complete" && ephemeralVaultQueue.has(tabId)) {
         const item = ephemeralVaultQueue.get(tabId)!;
+        if (item.expiresAt < Date.now()) {
+          zeroizeAndDelete(tabId);
+          return;
+        }
         setTimeout(() => {
-          if (!ephemeralVaultQueue.has(tabId)) return;
+          const current = ephemeralVaultQueue.get(tabId);
+          if (!current) return;
           try {
-            browser.tabs.sendMessage(tabId, {
-              type: "INJECT_CREDENTIALS",
-              username: item.username,
-              password: item.password,
-              appName: item.appName,
-            }).then(() => {
-              if (ephemeralVaultQueue.has(tabId)) {
-                item.password = null;
-                item.username = null;
-                ephemeralVaultQueue.delete(tabId);
-              }
-            }).catch(() => {});
+            browser.tabs.sendMessage(
+              tabId,
+              {
+                type: "INJECT_CREDENTIALS",
+                username: current.username,
+                password: current.password,
+                appName: current.appName,
+              },
+              { frameId: 0 }
+            ).catch(() => {});
           } catch {}
-        }, 500);
+        }, 350);
       }
     });
   }
