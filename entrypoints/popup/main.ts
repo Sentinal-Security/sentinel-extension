@@ -1,6 +1,6 @@
 import { browser } from "wxt/browser";
 
-const SENTINEL_PORTAL_URL = "https://web-beta-orcin-33.vercel.app";
+const DEFAULT_PORTAL_URL = "https://web-beta-orcin-33.vercel.app";
 
 document.addEventListener("DOMContentLoaded", () => {
   const contentEl = document.getElementById("content");
@@ -8,47 +8,52 @@ document.addEventListener("DOMContentLoaded", () => {
 
   try {
     browser.runtime.sendMessage({ type: "GET_SENTINEL_STATUS" }).then((response: any) => {
+      const portalUrl = response?.portalOrigin || DEFAULT_PORTAL_URL;
       if (response && response.isLoggedIn && response.user) {
-        renderLoggedIn(response.user);
+        renderLoggedIn(response.user, portalUrl, response.servicesCount || 0);
       } else {
         browser.storage.local.get("sentinelSession").then((stored: any) => {
           const s = stored?.sentinelSession;
           if (s && s.isLoggedIn && s.user) {
-            renderLoggedIn(s.user);
+            renderLoggedIn(
+              s.user,
+              s.portalOrigin || portalUrl,
+              Array.isArray(s.services) ? s.services.length : 0
+            );
           } else {
-            renderLoggedOut();
+            renderLoggedOut(portalUrl);
           }
-        }).catch(() => renderLoggedOut());
+        }).catch(() => renderLoggedOut(portalUrl));
       }
     }).catch(() => {
-      renderLoggedOut();
+      renderLoggedOut(DEFAULT_PORTAL_URL);
     });
   } catch {
-    renderLoggedOut();
+    renderLoggedOut(DEFAULT_PORTAL_URL);
   }
 
-  function renderLoggedIn(user: any) {
+  function renderLoggedIn(user: any, portalUrl: string, servicesCount: number) {
     if (!contentEl) return;
     contentEl.innerHTML = `
       <div class="status-card">
         <div class="status-badge" style="color: #34d399;">
           <span class="dot online"></span>
-          <span>Sentinel Connected</span>
+          <span>Sentinel Connected (${servicesCount} Linked ${servicesCount === 1 ? "App" : "Apps"})</span>
         </div>
         <div class="user-info">${user.email || user.username || "Authenticated User"}</div>
         <div class="desc" style="margin-top: 6px;">
-          Autofill bridge is active. When you launch vaulted credentials from the Sentinel Web Portal, this extension injects them directly into the target login form.
+          In-site authentication popup and autofill bridge are active. Open any linked website or launch from Sentinel Web Portal to authenticate and sign in automatically.
         </div>
       </div>
       <button id="openDashboardBtn" class="btn btn-primary">Open Sentinel Launchpad</button>
     `;
 
     document.getElementById("openDashboardBtn")?.addEventListener("click", () => {
-      browser.tabs.create({ url: `${SENTINEL_PORTAL_URL}/dashboard` });
+      browser.tabs.create({ url: `${portalUrl}/dashboard` });
     });
   }
 
-  function renderLoggedOut() {
+  function renderLoggedOut(portalUrl: string) {
     if (!contentEl) return;
     contentEl.innerHTML = `
       <div class="status-card">
@@ -57,14 +62,14 @@ document.addEventListener("DOMContentLoaded", () => {
           <span>Authentication Required</span>
         </div>
         <div class="desc">
-          You are not signed in to Sentinel Security. Please log in to your web portal account to enable credential autofill.
+          You are not signed in to Sentinel Security. Please log in to your web portal account to enable in-site authentication and credential autofill.
         </div>
       </div>
       <button id="loginBtn" class="btn btn-primary">Sign In to Sentinel</button>
     `;
 
     document.getElementById("loginBtn")?.addEventListener("click", () => {
-      browser.tabs.create({ url: `${SENTINEL_PORTAL_URL}/login` });
+      browser.tabs.create({ url: `${portalUrl}/login` });
     });
   }
 });

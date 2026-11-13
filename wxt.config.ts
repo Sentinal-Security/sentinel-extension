@@ -7,7 +7,7 @@ export default defineConfig({
   manifest: {
     name: "Sentinel Autofill Bridge",
     description: "Secure cross-browser autofill middleman bridge for Sentinel Security IAM Web Portal and Credential Vault.",
-    version: "1.1.1",
+    version: "1.2.0",
     permissions: [
       "storage",
       "tabs",
