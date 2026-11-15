@@ -51,7 +51,33 @@ const MULTI_TENANT_SUFFIXES = [
   ".pages.dev",
   ".railway.app",
   ".herokuapp.com",
+  ".azurewebsites.net",
+  ".firebaseapp.com",
+  ".web.app",
+  ".fly.dev",
+  ".workers.dev",
 ];
+
+const MULTI_PART_TLDS = new Set([
+  "co.uk",
+  "org.uk",
+  "ac.uk",
+  "com.ph",
+  "edu.ph",
+  "gov.ph",
+  "com.au",
+  "net.au",
+  "org.au",
+  "co.jp",
+  "ne.jp",
+  "or.jp",
+  "com.br",
+  "co.in",
+  "co.nz",
+  "co.za",
+  "com.sg",
+  "com.mx",
+]);
 
 export default defineBackground(() => {
   let sentinelSession: SentinelSession = {
@@ -66,8 +92,40 @@ export default defineBackground(() => {
   let lastKnownUserId: number | undefined = undefined;
   let lastBackendFetchAt = 0;
 
-  // Secure ephemeral store: Map<tabId, EphemeralVaultItem>
+  let lastWrittenSessionSnapshot = "";
+
+  // Secure ephemeral store: Map<tabId, EphemeralVaultItem>, mirrored to browser.storage.session
   const ephemeralVaultQueue = new Map<number, EphemeralVaultItem>();
+  const sessionStorageApi = (browser.storage as any)?.session;
+
+  function vaultStorageKey(tabId: number): string {
+    return `vault_tab_${tabId}`;
+  }
+
+  async function setEphemeralVaultItem(tabId: number, item: EphemeralVaultItem): Promise<void> {
+    ephemeralVaultQueue.set(tabId, item);
+    if (sessionStorageApi?.set) {
+      try {
+        await sessionStorageApi.set({ [vaultStorageKey(tabId)]: item });
+      } catch {}
+    }
+  }
+
+  async function getEphemeralVaultItem(tabId: number): Promise<EphemeralVaultItem | null> {
+    const mem = ephemeralVaultQueue.get(tabId);
+    if (mem) return mem;
+    if (sessionStorageApi?.get) {
+      try {
+        const res = await sessionStorageApi.get(vaultStorageKey(tabId));
+        const stored = res?.[vaultStorageKey(tabId)] as EphemeralVaultItem | undefined;
+        if (stored) {
+          ephemeralVaultQueue.set(tabId, stored);
+          return stored;
+        }
+      } catch {}
+    }
+    return null;
+  }
 
   function getPortalOrigin(): string {
     return sentinelSession.portalOrigin || DEFAULT_PORTAL_ORIGIN;
@@ -96,31 +154,57 @@ export default defineBackground(() => {
 
   function syncSessionState(session: any) {
     const isLoggedIn = Boolean(session?.isLoggedIn && session?.user);
-    const incomingServices = normalizeServices(session?.services || []);
-    const mergedServices =
-      incomingServices.length > 0 ? incomingServices : sentinelSession.services || lastKnownServices;
 
-    if (mergedServices.length > 0) {
-      lastKnownServices = mergedServices;
-    }
-    if (session?.user?.userId) {
-      lastKnownUserId = Number(session.user.userId);
+    if (!isLoggedIn) {
+      lastKnownServices = [];
+      lastKnownUserId = undefined;
+      sentinelSession = {
+        isLoggedIn: false,
+        user: null,
+        token: undefined,
+        portalOrigin: session?.portalOrigin || sentinelSession.portalOrigin || DEFAULT_PORTAL_ORIGIN,
+        services: [],
+        lastChecked: Date.now(),
+      };
+    } else {
+      const incomingServices = normalizeServices(session?.services || []);
+      const mergedServices =
+        incomingServices.length > 0 ? incomingServices : sentinelSession.services || lastKnownServices;
+
+      if (mergedServices.length > 0) {
+        lastKnownServices = mergedServices;
+      }
+      if (session?.user?.userId) {
+        lastKnownUserId = Number(session.user.userId);
+      }
+
+      sentinelSession = {
+        isLoggedIn: true,
+        user: session?.user || null,
+        token: session?.token || sentinelSession.token,
+        portalOrigin: session?.portalOrigin || sentinelSession.portalOrigin || DEFAULT_PORTAL_ORIGIN,
+        services: mergedServices,
+        lastChecked: Date.now(),
+      };
     }
 
-    sentinelSession = {
-      isLoggedIn,
-      user: session?.user || null,
-      token: session?.token || sentinelSession.token,
-      portalOrigin: session?.portalOrigin || sentinelSession.portalOrigin || DEFAULT_PORTAL_ORIGIN,
-      services: mergedServices,
-      lastChecked: Date.now(),
-    };
+    const snapshot = JSON.stringify({
+      isLoggedIn: sentinelSession.isLoggedIn,
+      userId: sentinelSession.user?.userId,
+      email: sentinelSession.user?.email,
+      token: sentinelSession.token,
+      portalOrigin: sentinelSession.portalOrigin,
+      services: sentinelSession.services,
+    });
+
+    if (snapshot === lastWrittenSessionSnapshot) return;
+    lastWrittenSessionSnapshot = snapshot;
 
     try {
       browser.storage.local.set({
         sentinelSession,
         lastKnownServices,
-        lastKnownUserId,
+        lastKnownUserId: lastKnownUserId ?? null,
       });
     } catch {}
   }
@@ -131,6 +215,11 @@ export default defineBackground(() => {
       item.password = null;
       item.username = null;
       ephemeralVaultQueue.delete(tabId);
+    }
+    if (sessionStorageApi?.remove) {
+      try {
+        sessionStorageApi.remove(vaultStorageKey(tabId)).catch(() => {});
+      } catch {}
     }
   }
 
@@ -250,9 +339,13 @@ export default defineBackground(() => {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 3500);
+        const headers: Record<string, string> = { Accept: "application/json" };
+        if (sentinelSession.token) {
+          headers["Authorization"] = `Bearer ${sentinelSession.token}`;
+        }
         const res = await fetch(`${base}/api/services?userId=${userId}`, {
           method: "GET",
-          headers: { Accept: "application/json" },
+          headers,
           cache: "no-store",
           signal: controller.signal,
         });
@@ -307,10 +400,46 @@ export default defineBackground(() => {
     const parts = clean.split(".");
     if (parts.length <= 2) return clean;
     const lastTwo = parts.slice(-2).join(".");
-    if (["co.uk", "com.ph", "edu.ph", "org.uk", "com.au"].includes(lastTwo) && parts.length >= 3) {
+    if (MULTI_PART_TLDS.has(lastTwo) && parts.length >= 3) {
       return parts.slice(-3).join(".");
     }
     return lastTwo;
+  }
+
+  function isSafeHttpUrl(raw: string): boolean {
+    try {
+      const u = new URL(raw);
+      return u.protocol === "https:" || u.protocol === "http:";
+    } catch {
+      return false;
+    }
+  }
+
+  function isSenderFromSentinelPortal(sender: any): boolean {
+    const rawUrl = sender?.url || sender?.tab?.url || "";
+    if (!rawUrl) return false;
+    try {
+      const parsed = new URL(rawUrl);
+      return isSentinelPortalUrl(parsed);
+    } catch {
+      return false;
+    }
+  }
+
+  function doesUrlMatchDestination(tabUrlStr: string | undefined, destinationStr: string): boolean {
+    if (!tabUrlStr) return false;
+    const tabUrl = parseUrlSafe(tabUrlStr);
+    const destUrl = parseUrlSafe(destinationStr);
+    if (!tabUrl || !destUrl) return false;
+    const tabHost = stripWww(tabUrl.hostname);
+    const destHost = stripWww(destUrl.hostname);
+    if (tabHost === destHost) {
+      if ((tabHost === "localhost" || tabHost === "127.0.0.1") && destUrl.port) {
+        return tabUrl.port === destUrl.port;
+      }
+      return true;
+    }
+    return getRegistrableDomain(tabHost) === getRegistrableDomain(destHost);
   }
 
   function isSentinelPortalUrl(url: URL): boolean {
@@ -328,9 +457,9 @@ export default defineBackground(() => {
     return false;
   }
 
-  function resolveDemoAppKey(url: URL, clientId?: string, name?: string): string | null {
-    const host = stripWww(url.hostname);
-    const port = url.port;
+  function resolveDemoAppKey(url: URL | null, clientId?: string, name?: string): string | null {
+    const host = url ? stripWww(url.hostname) : "";
+    const port = url ? url.port : "";
     const cid = (clientId || "").toLowerCase();
     const nm = (name || "").toLowerCase();
 
@@ -379,9 +508,7 @@ export default defineBackground(() => {
 
     for (const service of services) {
       const serviceUrl = parseUrlSafe(service.loginUrl);
-      const serviceDemoFamily = serviceUrl
-        ? resolveDemoAppKey(serviceUrl, service.clientId, service.name)
-        : resolveDemoAppKey(new URL("https://placeholder.local"), service.clientId, service.name);
+      const serviceDemoFamily = resolveDemoAppKey(serviceUrl, service.clientId, service.name);
 
       // 1. Check Demo App family equivalence (works across localhost:3001-3003 and vercel demo URLs)
       if (tabDemoFamily && serviceDemoFamily && tabDemoFamily === serviceDemoFamily) {
@@ -465,6 +592,10 @@ export default defineBackground(() => {
 
     // 1. Session state update from Sentinel Web Portal
     if (message.type === "SENTINEL_SESSION_UPDATE") {
+      if (!isSenderFromSentinelPortal(sender)) {
+        sendResponse({ success: false, reason: "UNTRUSTED_ORIGIN" });
+        return true;
+      }
       syncSessionState(message.session);
       if (sentinelSession.user?.userId && (!sentinelSession.services || sentinelSession.services.length === 0)) {
         refreshServicesFromBackend(true).catch(() => {});
@@ -495,7 +626,7 @@ export default defineBackground(() => {
       sessionReady.then(async () => {
         const tabId = sender.tab?.id;
         // If this tab already has pending unlocked credentials, do not show the prompt
-        if (tabId && ephemeralVaultQueue.has(tabId)) {
+        if (tabId && (await getEphemeralVaultItem(tabId))) {
           sendResponse({ matched: false, hasPendingAutofill: true });
           return;
         }
@@ -515,23 +646,25 @@ export default defineBackground(() => {
           const parsed = parseUrlSafe(targetUrlStr);
           if (parsed && !isSentinelPortalUrl(parsed)) {
             const demoKey = resolveDemoAppKey(parsed);
-            const host = stripWww(parsed.hostname);
-            let friendlyName = host;
-            if (demoKey === "acme_hr") friendlyName = "Acme HR Portal";
-            else if (demoKey === "fintech_payroll") friendlyName = "FinTech Payroll Portal";
-            else if (demoKey === "devops_incident") friendlyName = "DevOps Incident Command";
-            else if (host.includes("facebook.com")) friendlyName = "Facebook";
-            else if (host.includes("github.com")) friendlyName = "GitHub";
-            else if (host.includes("google.com")) friendlyName = "Google";
+            if (demoKey || message.hasPasswordInput) {
+              const host = stripWww(parsed.hostname);
+              let friendlyName = host;
+              if (demoKey === "acme_hr") friendlyName = "Acme HR Portal";
+              else if (demoKey === "fintech_payroll") friendlyName = "FinTech Payroll Portal";
+              else if (demoKey === "devops_incident") friendlyName = "DevOps Incident Command";
+              else if (host.includes("facebook.com")) friendlyName = "Facebook";
+              else if (host.includes("github.com")) friendlyName = "GitHub";
+              else if (host.includes("google.com")) friendlyName = "Google";
 
-            matchedService = {
-              id: "",
-              name: friendlyName,
-              loginUrl: targetUrlStr,
-              clientId: demoKey || "",
-              isVault: !demoKey,
-              mfaRequired: true,
-            };
+              matchedService = {
+                id: "",
+                name: friendlyName,
+                loginUrl: targetUrlStr,
+                clientId: demoKey || "",
+                isVault: !demoKey,
+                mfaRequired: true,
+              };
+            }
           }
         }
 
@@ -593,6 +726,10 @@ export default defineBackground(() => {
 
     // 5. Vault launch or approval handoff initiated from Sentinel Web Portal (/dashboard or /login)
     if (message.type === "TRIGGER_VAULT_AUTOFILL") {
+      if (!isSenderFromSentinelPortal(sender)) {
+        sendResponse({ success: false, reason: "UNTRUSTED_ORIGIN" });
+        return true;
+      }
       sessionReady.then(async () => {
         if (message.session?.isLoggedIn && message.session?.user) {
           syncSessionState(message.session);
@@ -613,6 +750,10 @@ export default defineBackground(() => {
         if (!/^https?:\/\//i.test(sanitizedUrl)) {
           sanitizedUrl = "https://" + sanitizedUrl;
         }
+        if (!isSafeHttpUrl(sanitizedUrl)) {
+          sendResponse({ success: false, reason: "INVALID_URL" });
+          return;
+        }
 
         const nonce =
           typeof crypto !== "undefined" && crypto.randomUUID
@@ -628,7 +769,7 @@ export default defineBackground(() => {
             try {
               const existingTab = await browser.tabs.get(targetTabId);
               if (existingTab && existingTab.id) {
-                ephemeralVaultQueue.set(existingTab.id, {
+                await setEphemeralVaultItem(existingTab.id, {
                   nonce,
                   username: username || "",
                   password: password || "",
@@ -672,9 +813,9 @@ export default defineBackground(() => {
         try {
           browser.tabs
             .create({ url: sanitizedUrl, active: true })
-            .then((tab) => {
+            .then(async (tab) => {
               if (tab?.id) {
-                ephemeralVaultQueue.set(tab.id, {
+                await setEphemeralVaultItem(tab.id, {
                   nonce,
                   username: username || "",
                   password: password || "",
@@ -702,11 +843,15 @@ export default defineBackground(() => {
 
     // 6. SSO redirect back to source tab when an SSO app was launched via the in-site popup
     if (message.type === "TRIGGER_SSO_REDIRECT") {
+      if (!isSenderFromSentinelPortal(sender)) {
+        sendResponse({ success: false, reason: "UNTRUSTED_ORIGIN" });
+        return true;
+      }
       sessionReady.then(async () => {
         const { destination, sourceTabId, closeApprovalTab } = message;
         const approvalSenderTabId = sender.tab?.id;
-        if (!destination) {
-          sendResponse({ success: false });
+        if (!destination || !isSafeHttpUrl(String(destination))) {
+          sendResponse({ success: false, reason: "INVALID_URL" });
           return;
         }
 
@@ -741,18 +886,23 @@ export default defineBackground(() => {
     if (message.type === "REQUEST_PENDING_CREDENTIALS") {
       const tabId = sender.tab?.id;
       const isTopFrame = sender.frameId === undefined || sender.frameId === 0;
-      if (tabId && isTopFrame && ephemeralVaultQueue.has(tabId)) {
-        const item = ephemeralVaultQueue.get(tabId)!;
-        if (item.expiresAt < Date.now()) {
-          zeroizeAndDelete(tabId);
-          sendResponse({ hasCredentials: false });
-          return true;
-        }
-        sendResponse({
-          hasCredentials: true,
-          username: item.username,
-          password: item.password,
-          appName: item.appName,
+      if (tabId && isTopFrame) {
+        getEphemeralVaultItem(tabId).then((item) => {
+          if (!item) {
+            sendResponse({ hasCredentials: false });
+            return;
+          }
+          if (item.expiresAt < Date.now() || !doesUrlMatchDestination(sender.tab?.url, item.destination)) {
+            zeroizeAndDelete(tabId);
+            sendResponse({ hasCredentials: false });
+            return;
+          }
+          sendResponse({
+            hasCredentials: true,
+            username: item.username,
+            password: item.password,
+            appName: item.appName,
+          });
         });
       } else {
         sendResponse({ hasCredentials: false });
@@ -773,15 +923,16 @@ export default defineBackground(() => {
 
   // Watch for tab loading completion to dispatch injection into the top frame
   if (browser.tabs && browser.tabs.onUpdated) {
-    browser.tabs.onUpdated.addListener((tabId: number, changeInfo: any) => {
-      if (changeInfo.status === "complete" && ephemeralVaultQueue.has(tabId)) {
-        const item = ephemeralVaultQueue.get(tabId)!;
-        if (item.expiresAt < Date.now()) {
+    browser.tabs.onUpdated.addListener(async (tabId: number, changeInfo: any, tab: any) => {
+      if (changeInfo.status === "complete") {
+        const item = await getEphemeralVaultItem(tabId);
+        if (!item) return;
+        if (item.expiresAt < Date.now() || !doesUrlMatchDestination(tab?.url, item.destination)) {
           zeroizeAndDelete(tabId);
           return;
         }
-        setTimeout(() => {
-          const current = ephemeralVaultQueue.get(tabId);
+        setTimeout(async () => {
+          const current = await getEphemeralVaultItem(tabId);
           if (!current) return;
           try {
             browser.tabs

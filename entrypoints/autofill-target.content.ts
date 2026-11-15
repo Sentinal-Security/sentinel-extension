@@ -580,14 +580,22 @@ export default defineContentScript({
             const nextBtn =
               form?.querySelector<HTMLElement>('button, input[type="submit"], #identifierNext') ||
               document.querySelector<HTMLElement>('#identifierNext, button[type="submit"]');
-            if (nextBtn) {
+            if (nextBtn && password) {
               nextBtn.click();
-              if (password) {
+              const nextPassword = password;
+              password = null;
+              username = null;
+              setTimeout(() => {
                 autofillStarted = false;
-                setTimeout(() => {
-                  performAutofill(null, password, appName);
-                }, 1200);
-              }
+                performAutofill(null, nextPassword, appName);
+              }, 1200);
+            } else {
+              autofillStarted = false;
+              username = null;
+              password = null;
+              try {
+                browser.runtime.sendMessage({ type: "AUTOFILL_COMPLETED" }).catch(() => {});
+              } catch {}
             }
           }
         } else if (attempts >= maxAttempts) {
@@ -595,6 +603,9 @@ export default defineContentScript({
           autofillStarted = false;
           username = null;
           password = null;
+          try {
+            browser.runtime.sendMessage({ type: "AUTOFILL_COMPLETED" }).catch(() => {});
+          } catch {}
         }
       }, 300);
     }
@@ -632,6 +643,7 @@ export default defineContentScript({
           .sendMessage({
             type: "CHECK_SITE_INTEGRATION",
             url: window.location.href,
+            hasPasswordInput: Boolean(passwordInput),
           })
           .then((response: any) => {
             if (!response || !response.matched || !response.service) {
@@ -674,8 +686,23 @@ export default defineContentScript({
         evaluateSiteForPrompt();
       }
 
-      // Observe dynamic SPA transitions and login form rendering
-      setInterval(evaluateSiteForPrompt, 1800);
+      // Observe dynamic SPA transitions and login form rendering without aggressive polling
+      let evalDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+      const scheduleEvaluation = () => {
+        if (evalDebounceTimer) clearTimeout(evalDebounceTimer);
+        evalDebounceTimer = setTimeout(evaluateSiteForPrompt, 500);
+      };
+
+      const observer = new MutationObserver(() => {
+        if (document.visibilityState === "visible") {
+          scheduleEvaluation();
+        }
+      });
+      if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+      }
+      window.addEventListener("popstate", scheduleEvaluation);
+      window.addEventListener("hashchange", scheduleEvaluation);
     }
   },
 });

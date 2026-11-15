@@ -126,14 +126,26 @@ export default defineContentScript({
       };
     }
 
+    let lastSentSessionKey = "";
+
     function checkPortalSession() {
       const session = readStoredPortalSession();
-      try {
-        browser.runtime.sendMessage({
-          type: "SENTINEL_SESSION_UPDATE",
-          session,
-        }).catch(() => {});
-      } catch {}
+      const key = JSON.stringify({
+        isLoggedIn: session.isLoggedIn,
+        userId: session.user?.userId,
+        token: session.token,
+        servicesLen: session.services?.length || 0,
+      });
+
+      if (key !== lastSentSessionKey) {
+        lastSentSessionKey = key;
+        try {
+          browser.runtime.sendMessage({
+            type: "SENTINEL_SESSION_UPDATE",
+            session,
+          }).catch(() => {});
+        } catch {}
+      }
 
       if (!session.isLoggedIn) {
         try {
@@ -143,7 +155,11 @@ export default defineContentScript({
     }
 
     checkPortalSession();
-    setInterval(checkPortalSession, 3000);
+    setInterval(() => {
+      if (document.visibilityState === "visible") {
+        checkPortalSession();
+      }
+    }, 3000);
 
     // Real-time synchronization when login/logout or integrations change in local storage
     window.addEventListener("storage", (e: StorageEvent) => {

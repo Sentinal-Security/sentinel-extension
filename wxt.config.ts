@@ -12,12 +12,9 @@ export default defineConfig({
       "storage",
       "tabs",
       "activeTab",
-      "cookies",
       "scripting",
     ],
     host_permissions: [
-      "https://web-beta-orcin-33.vercel.app/*",
-      "http://localhost:3000/*",
       "<all_urls>",
     ],
     browser_specific_settings: {
